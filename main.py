@@ -1,482 +1,361 @@
-#!/usr/bin/env python3
-"""
-Telegram Media Downloader Bot
-Instagram, YouTube, TikTok va boshqa platformalardan video yuklab oluvchi bot
-"""
-
-import os
-import asyncio
-import logging
-import tempfile
-import shutil
-from datetime import datetime
-from urllib.parse import urlparse
+import telebot
 import re
+from datetime import datetime, timedelta
+import json
+import os
 
-import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+# Bot konfiguratsiyasi
+BOT_TOKEN = "8437960997:AAHsEMgqmAss1aqQcAzpa3DugQLTERA9168"  # Bu yerga o'z bot tokeningizni kiriting
+ADMIN_ID = 5922089904  # Bu yerga o'z Telegram ID ingizni kiriting
 
-# Bot Configuration
-BOT_TOKEN='8437960997:AAHsEMgqmAss1aqQcAzpa3DugQLTERA9168'
-ADMIN_ID='5922089904'
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# File Configuration
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-TEMP_DIR = './temp'
+# Foydalanuvchi ma'lumotlarini saqlash uchun
+users_data = {}
+user_tasks = {}  # Foydalanuvchi o'zi kiritgan vazifalar
 
-# Supported Platforms
-SUPPORTED_PLATFORMS = [
-    'youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com',
-    'facebook.com', 'twitter.com', 'x.com', 'vimeo.com',
-    'dailymotion.com', 'twitch.tv'
-]
-
-# Bot Messages
-MESSAGES = {
-    'start': '''🎬 Assalomu alaykum! Men sizga ijtimoiy tarmoqlardan video yuklab beraman.
-
-📱 Qo'llab-quvvatlanadigan platformalar:
-• YouTube (youtu.be, youtube.com)
-• Instagram
-• TikTok
-• Facebook
-• Twitter/X
-• Vimeo
-• Twitch
-• Dailymotion
-
-🔗 Foydalanish: Video linkini yuboring''',
-
-    'help': '''📚 Bot qanday ishlaydi:
-
-🔗 Video yuklab olish:
-1. Video linkini yuboring
-2. Sifatni tanlang
-3. Yuklashni kuting
-
-💡 Maslahatlar:
-• Qisqa videolar tezroq yuklanadi
-• Maksimal fayl hajmi: 50MB
-• Barcha formatlar qo'llab-quvvatlanadi
-
-❓ Yordam kerakmi? /help''',
-
-    'processing': '⏳ Link tekshirilmoqda...',
-    'downloading': '📥 Video yuklanmoqda...',
-    'uploading': '📤 Telegram ga yuklanmoqda...',
-    'invalid_url': '❌ Noto\'g\'ri link. Qo\'llab-quvvatlanadigan platformadan link yuboring.',
-    'download_error': '❌ Yuklashda xatolik. Link tekshiring yoki boshqa video sinab ko\'ring.',
-    'file_too_large': '❌ Video hajmi juda katta (max 50MB). Boshqa sifatni tanlang.',
-    'success': '✅ Video muvaffaqiyatli yuklandi!',
-    'error': '❌ Xatolik yuz berdi. Qaytadan urinib ko\'ring.',
-    'unsupported': '❌ Bu platform hozircha qo\'llab-quvvatlanmaydi.',
-    'no_video': '❌ Video topilmadi. Link tekshiring.',
-    'timeout': '❌ Vaqt tugadi. Qaytadan urinib ko\'ring.'
-}
-
-# Setup logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Create temp directory
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-class MediaBot:
-    def __init__(self):
-        self.downloading = set()  # Track active downloads
-
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start command handler"""
-        keyboard = [
-            [InlineKeyboardButton("📹 Video yuklab olish", callback_data="help_video")],
-            [InlineKeyboardButton("📚 Qo'llanma", callback_data="help")],
-            [InlineKeyboardButton("ℹ️ Bot haqida", callback_data="about")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(MESSAGES['start'], reply_markup=reply_markup)
-
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Help command handler"""
-        await update.message.reply_text(MESSAGES['help'])
-
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle button callbacks"""
-        query = update.callback_query
-        await query.answer()
-
-        if query.data == "help_video":
-            text = """📹 Video yuklab olish:
-
-🔗 Quyidagi platformalardan link yuboring:
-• YouTube: https://youtu.be/xxxxx
-• Instagram: https://instagram.com/p/xxxxx
-• TikTok: https://tiktok.com/@user/video/xxxxx
-• Facebook, Twitter, Vimeo va boshqalar
-
-⚙️ Sifat tanlovlari:
-• 🔥 Eng yuqori sifat (HD/4K)
-• ⚡ O'rta sifat (tez yuklanadi)
-• 🎵 Faqat audio (MP3)
-
-💡 Video linkini yuboring va sifatni tanlang!"""
-
-        elif query.data == "help":
-            text = MESSAGES['help']
-
-        elif query.data == "about":
-            text = """ℹ️ Bot haqida:
-
-🤖 Telegram Media Downloader Bot
-📅 Versiya: 1.0
-⚡ Python + yt-dlp
-🆓 To'liq bepul
-
-👨‍💻 Yaratuvchi: @your_username
-📞 Yordam: /help
-
-🔒 Xavfsizlik: Barcha fayllar vaqtinchalik saqlanadi"""
-
+def parse_time_tasks(text):
+    """Matndan vaqt va vazifalarni ajratib olish"""
+    tasks = []
+    lines = text.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Vaqt formatini topish (HH:MM yoki H:MM)
+        time_match = re.search(r'(\d{1,2}):(\d{2})', line)
+        if time_match:
+            time_str = f"{time_match.group(1).zfill(2)}:{time_match.group(2)}"
+            task = re.sub(r'\d{1,2}:\d{2}', '', line).strip()
+            
+            if task:
+                emoji = get_task_emoji(task)
+                tasks.append({"time": time_str, "task": task, "emoji": emoji})
         else:
-            text = MESSAGES['start']
+            # Vaqtsiz vazifa
+            emoji = get_task_emoji(line)
+            tasks.append({"time": None, "task": line, "emoji": emoji})
+    
+    return sorted(tasks, key=lambda x: x['time'] if x['time'] else '99:99')
 
-        keyboard = [[InlineKeyboardButton("◀️ Orqaga", callback_data="back")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+def get_task_emoji(task):
+    """Vazifaga mos emoji tanlash"""
+    task_lower = task.lower()
+    
+    emoji_map = {
+        'uyg': '⏰', 'turan': '⏰', 'uyqu': '🌙', 'yotish': '🌙',
+        'maktab': '🎓', 'oquv': '📚', 'dars': '📖', 'universitet': '🎓',
+        'sport': '🏃‍♂️', 'futbol': '⚽', 'yugur': '🏃‍♂️', 'mashq': '💪',
+        'ovqat': '🍽️', 'tushlik': '🥗', 'nonushta': '🥞', 'kechki': '🍽️',
+        'suv': '💧', 'ichim': '💧', 'ichish': '💧',
+        'dam': '😌', 'tanaffus': '☕', 'hordiq': '😴', 'tinchlan': '😌',
+        'ish': '💼', 'vazifa': '📝', 'topshiriq': '✅', 'loyiha': '💼',
+        'kitob': '📚', 'oquw': '📖', 'mutolaa': '📚',
+        'muzika': '🎵', 'kino': '🎬', 'film': '🎬',
+        'do\'st': '👥', 'oila': '👨‍👩‍👧‍👦', 'uchrashuv': '👥',
+        'dush': '🚿', 'yuvin': '🚿', 'toza': '🧼',
+        'pul': '💰', 'xarid': '🛒', 'bozor': '🛒',
+        'telefon': '📱', 'kompyuter': '💻', 'internet': '🌐'
+    }
+    
+    for key, emoji in emoji_map.items():
+        if key in task_lower:
+            return emoji
+    
+    return '📌'
 
-        await query.edit_message_text(text, reply_markup=reply_markup)
+def add_healthy_habits(tasks):
+    """Sog'lom odatlarni qo'shish"""
+    task_times = [task['time'] for task in tasks if task['time']]
+    
+    needed_habits = []
+    
+    # Nonushta tekshirish
+    morning_meals = any('07:00' <= time <= '10:00' and any(word in task['task'].lower() 
+                       for word in ['ovqat', 'nonushta', 'tushlik']) 
+                      for task in tasks if task['time'])
+    if not morning_meals:
+        needed_habits.append({"time": "08:30", "task": "Nonushta", "emoji": "🥞"})
+    
+    # Suv ichish tekshirish
+    water_tasks = any('suv' in task['task'].lower() or 'ichim' in task['task'].lower() 
+                     for task in tasks)
+    if not water_tasks:
+        needed_habits.extend([
+            {"time": "09:00", "task": "Suv ichish", "emoji": "💧"},
+            {"time": "15:00", "task": "Suv ichish", "emoji": "💧"}
+        ])
+    
+    # Uyqu vaqti tekshirish
+    sleep_time = any('21:00' <= task['time'] <= '23:59' and 
+                    any(word in task['task'].lower() for word in ['uyqu', 'yotish']) 
+                    for task in tasks if task['time'])
+    if not sleep_time:
+        needed_habits.append({"time": "22:30", "task": "Uyqu vaqti", "emoji": "🌙"})
+    
+    # Barcha vazifalarni birlashtirish va saralash
+    all_tasks = tasks + needed_habits
+    return sorted(all_tasks, key=lambda x: x['time'] if x['time'] else '99:99')
 
-    def is_supported_url(self, url: str) -> bool:
-        """Check if URL is from supported platform"""
-        try:
-            # Clean URL
-            url = url.strip()
-            if not url.startswith(('http://', 'https://')):
-                url = 'https://' + url
+def format_schedule(tasks):
+    """Rejani chiroyli formatda ko'rsatish"""
+    if not tasks:
+        return "📋 Hech qanday reja topilmadi."
+    
+    schedule_text = "🗓 Bugungi rejangiz:\n\n"
+    
+    for task in tasks:
+        if task['time']:
+            schedule_text += f"• {task['emoji']} {task['time']} – {task['task']}\n"
+        else:
+            schedule_text += f"• {task['emoji']} {task['task']}\n"
+    
+    return schedule_text
 
-            domain = urlparse(url).netloc.lower()
-            return any(platform in domain for platform in SUPPORTED_PLATFORMS)
-        except:
-            return False
+def get_default_schedule():
+    """Standart kunlik reja"""
+    default_tasks = [
+        {"time": "07:00", "task": "Uyg'onish", "emoji": "⏰"},
+        {"time": "08:00", "task": "Yengil sport", "emoji": "🏃‍♂️"},
+        {"time": "09:00", "task": "O'qish yoki ish", "emoji": "📚"},
+        {"time": "13:00", "task": "Tushlik", "emoji": "🥗"},
+        {"time": "16:00", "task": "Dam olish", "emoji": "😌"},
+        {"time": "18:00", "task": "Kechki ovqat", "emoji": "🍽️"},
+        {"time": "20:00", "task": "Suv ichish", "emoji": "💧"},
+        {"time": "22:30", "task": "Uyqu", "emoji": "🌙"}
+    ]
+    return default_tasks
 
-    def extract_url_from_text(self, text: str) -> str:
-        """Extract URL from text message"""
-        # Find URLs in text
-        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-        urls = re.findall(url_pattern, text)
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    welcome_text = """
+🤖 Assalomu alaykum! Men sizning kundalik yordamchingizman.
 
-        if urls:
-            return urls[0]
+📝 **Vazifalar qo'shish:**
+/add_task - Yangi vazifa qo'shish
+/my_tasks - Barcha vazifalaringizni ko'rish
+/clear_tasks - Barcha vazifalarni o'chirish
 
-        # Check if text itself is a URL (without http)
-        if any(platform in text.lower() for platform in SUPPORTED_PLATFORMS):
-            return text.strip()
+⏰ **Reja tuzish:**
+Menga quyidagicha yozing:
+8:00 uyg'onish
+10:00 maktab  
+15:00 sport
 
-        return None
+🔧 **Boshqa buyruqlar:**
+/today - Bugungi rejani ko'rish
+/example - Misol ko'rish
+/help - Yordam
+"""
+    bot.reply_to(message, welcome_text)
 
-    async def get_video_info(self, url: str) -> dict:
-        """Get video information without downloading"""
-        try:
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': False,
-            }
+@bot.message_handler(commands=['add_task'])
+def add_task_command(message):
+    msg = bot.reply_to(message, "📝 Yangi vazifangizni yozing:\n\nMisol: 14:00 kitob o'qish")
+    bot.register_next_step_handler(msg, process_add_task)
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-
-                return {
-                    'success': True,
-                    'title': info.get('title', 'Video')[:100],  # Limit title length
-                    'duration': info.get('duration', 0),
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'view_count': info.get('view_count', 0),
-                    'formats': len(info.get('formats', [])),
-                    'thumbnail': info.get('thumbnail')
-                }
-
-        except Exception as e:
-            logger.error(f"Info extraction error: {e}")
-            return {'success': False, 'error': str(e)}
-
-    async def download_video(self, url: str, quality: str = 'best', user_id: int = None) -> dict:
-        """Download video using yt-dlp"""
-        try:
-            # Prevent multiple downloads from same user
-            if user_id in self.downloading:
-                return {'success': False, 'error': 'already_downloading'}
-
-            self.downloading.add(user_id)
-
-            # Set format based on quality
-            if quality == 'audio':
-                format_selector = 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio'
-                ext = 'mp3'
-            elif quality == 'worst':
-                format_selector = 'worst[height<=480]/worst'
-                ext = 'mp4'
-            else:  # best
-                format_selector = 'best[height<=720]/best[ext=mp4]/best'
-                ext = 'mp4'
-
-            # Unique filename
-            timestamp = int(datetime.now().timestamp())
-            filename = f"video_{user_id}_{timestamp}"
-
-            # yt-dlp options
-            ydl_opts = {
-                'format': format_selector,
-                'outtmpl': f'{TEMP_DIR}/{filename}.%(ext)s',
-                'max_filesize': MAX_FILE_SIZE,
-                'writeinfojson': False,
-                'writesubtitles': False,
-                'writeautomaticsub': False,
-                'ignoreerrors': False,
-                'no_warnings': True,
-                'extractaudio': quality == 'audio',
-                'audioformat': 'mp3' if quality == 'audio' else None,
-                'audioquality': '192' if quality == 'audio' else None,
-            }
-
-            # Add post-processor for audio
-            if quality == 'audio':
-                ydl_opts['postprocessors'] = [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }]
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Download
-                ydl.download([url])
-
-                # Find downloaded file
-                for file in os.listdir(TEMP_DIR):
-                    if file.startswith(f"video_{user_id}_{timestamp}"):
-                        filepath = os.path.join(TEMP_DIR, file)
-
-                        # Check file size
-                        if os.path.getsize(filepath) > MAX_FILE_SIZE:
-                            os.remove(filepath)
-                            return {'success': False, 'error': 'file_too_large'}
-
-                        return {
-                            'success': True,
-                            'filepath': filepath,
-                            'filename': file,
-                            'size': os.path.getsize(filepath)
-                        }
-
-                return {'success': False, 'error': 'file_not_found'}
-
-        except yt_dlp.DownloadError as e:
-            logger.error(f"yt-dlp download error: {e}")
-            return {'success': False, 'error': 'download_failed'}
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            return {'success': False, 'error': str(e)}
-        finally:
-            if user_id in self.downloading:
-                self.downloading.remove(user_id)
-
-    def cleanup_file(self, filepath: str):
-        """Clean up downloaded file"""
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages (URLs)"""
-        message = update.message
-        user_id = message.from_user.id
-
-        if not message.text:
-            return
-
-        # Extract URL from message
-        url = self.extract_url_from_text(message.text)
-
-        if not url:
-            await message.reply_text("❌ Link topilmadi. Video linkini yuboring.")
-            return
-
-        if not self.is_supported_url(url):
-            await message.reply_text(MESSAGES['invalid_url'])
-            return
-
-        # Check if user is already downloading
-        if user_id in self.downloading:
-            await message.reply_text("⏳ Sizning boshqa videongiz yuklanmoqda. Iltimos kuting.")
-            return
-
-        # Show processing message
-        status_msg = await message.reply_text(MESSAGES['processing'])
-
-        # Get video info
-        info = await self.get_video_info(url)
-
-        if not info['success']:
-            await status_msg.edit_text(MESSAGES['download_error'])
-            return
-
-        # Show video info and quality options
-        video_info = f"📹 **{info['title']}**\n"
-        if info['duration']:
-            minutes = info['duration'] // 60
-            seconds = info['duration'] % 60
-            video_info += f"⏱ Davomiyligi: {minutes}:{seconds:02d}\n"
-        if info['uploader']:
-            video_info += f"👤 Kanal: {info['uploader']}\n"
-
-        video_info += "\n🎯 Sifatni tanlang:"
-
-        # Quality selection keyboard
-        keyboard = [
-            [InlineKeyboardButton("🔥 Eng yuqori sifat", callback_data=f"dl_best_{message.message_id}")],
-            [InlineKeyboardButton("⚡ O'rta sifat (tez)", callback_data=f"dl_worst_{message.message_id}")],
-            [InlineKeyboardButton("🎵 Faqat audio (MP3)", callback_data=f"dl_audio_{message.message_id}")],
-            [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_{message.message_id}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        # Store URL in context
-        context.user_data[f'url_{message.message_id}'] = url
-
-        await status_msg.edit_text(video_info, reply_markup=reply_markup, parse_mode='Markdown')
-
-    async def handle_download_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle download quality selection"""
-        query = update.callback_query
-        await query.answer()
-
-        data = query.data
-        user_id = query.from_user.id
-
-        if data.startswith('cancel_'):
-            msg_id = data.split('_')[1]
-            if f'url_{msg_id}' in context.user_data:
-                del context.user_data[f'url_{msg_id}']
-            await query.edit_message_text("❌ Bekor qilindi.")
-            return
-
-        if not data.startswith('dl_'):
-            return
-
-        parts = data.split('_')
-        quality = parts[1]  # best, worst, audio
-        msg_id = parts[2]
-
-        # Get URL from context
-        url = context.user_data.get(f'url_{msg_id}')
-        if not url:
-            await query.edit_message_text("❌ Link topilmadi. Qaytadan urinib ko'ring.")
-            return
-
-        # Check if user is already downloading
-        if user_id in self.downloading:
-            await query.answer("⏳ Sizning boshqa videongiz yuklanmoqda!", show_alert=True)
-            return
-
-        await query.edit_message_text(MESSAGES['downloading'])
-
-        try:
-            # Download video
-            result = await self.download_video(url, quality, user_id)
-
-            if not result['success']:
-                error_msg = MESSAGES.get(result['error'], MESSAGES['download_error'])
-                await query.edit_message_text(error_msg)
-                return
-
-            # Update status
-            await query.edit_message_text(MESSAGES['uploading'])
-
-            # Send file
-            filepath = result['filepath']
-            filename = result['filename']
-
-            try:
-                if quality == 'audio':
-                    # Send as audio
-                    with open(filepath, 'rb') as audio_file:
-                        await context.bot.send_audio(
-                            chat_id=query.message.chat_id,
-                            audio=audio_file,
-                            caption="🎵 Audio yuklandi!",
-                            reply_to_message_id=query.message.message_id
-                        )
-                else:
-                    # Send as video
-                    with open(filepath, 'rb') as video_file:
-                        await context.bot.send_video(
-                            chat_id=query.message.chat_id,
-                            video=video_file,
-                            caption="🎬 Video yuklandi!",
-                            reply_to_message_id=query.message.message_id,
-                            supports_streaming=True
-                        )
-
-                await query.edit_message_text(MESSAGES['success'])
-
-            except Exception as e:
-                logger.error(f"File send error: {e}")
-                await query.edit_message_text("❌ Faylni yuborishda xatolik. Fayl hajmi katta bo'lishi mumkin.")
-
-            finally:
-                # Clean up file
-                self.cleanup_file(filepath)
-
-        except Exception as e:
-            logger.error(f"Download callback error: {e}")
-            await query.edit_message_text(MESSAGES['download_error'])
-
-        # Clean up context
-        if f'url_{msg_id}' in context.user_data:
-            del context.user_data[f'url_{msg_id}']
-
-def main():
-    """Main function"""
-    if not BOT_TOKEN or BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("❌ BOT_TOKEN o'rnatilmagan!")
-        print("Bot tokenini olish uchun @BotFather ga murojaat qiling.")
-        print("Keyin BOT_TOKEN environment variable sifatida o'rnating:")
-        print("export BOT_TOKEN='your_bot_token_here'")
+def process_add_task(message):
+    user_id = message.from_user.id
+    task_text = message.text.strip()
+    
+    if not task_text:
+        bot.reply_to(message, "❌ Vazifa bo'sh bo'lishi mumkin emas!")
         return
+    
+    # Foydalanuvchi vazifalarini saqlash
+    if user_id not in user_tasks:
+        user_tasks[user_id] = []
+    
+    # Vazifani tahlil qilish
+    parsed_tasks = parse_time_tasks(task_text)
+    
+    if parsed_tasks:
+        user_tasks[user_id].extend(parsed_tasks)
+        bot.reply_to(message, f"✅ Vazifa qo'shildi: {task_text}\n\n/my_tasks - barcha vazifalarni ko'rish")
+    else:
+        # Vaqtsiz vazifa
+        emoji = get_task_emoji(task_text)
+        user_tasks[user_id].append({"time": None, "task": task_text, "emoji": emoji})
+        bot.reply_to(message, f"✅ Vazifa qo'shildi: {emoji} {task_text}")
 
-    print("🤖 Telegram Media Downloader Bot")
-    print("=" * 40)
+@bot.message_handler(commands=['my_tasks'])
+def show_my_tasks(message):
+    user_id = message.from_user.id
+    
+    if user_id not in user_tasks or not user_tasks[user_id]:
+        bot.reply_to(message, "📋 Sizda hali vazifalar yo'q.\n\n/add_task - vazifa qo'shish")
+        return
+    
+    tasks_text = "📋 Sizning vazifalaringiz:\n\n"
+    
+    # Vaqtli vazifalarni saralash
+    sorted_tasks = sorted(user_tasks[user_id], key=lambda x: x['time'] if x['time'] else '99:99')
+    
+    for i, task in enumerate(sorted_tasks, 1):
+        if task['time']:
+            tasks_text += f"{i}. {task['emoji']} {task['time']} – {task['task']}\n"
+        else:
+            tasks_text += f"{i}. {task['emoji']} {task['task']}\n"
+    
+    tasks_text += "\n🔧 /clear_tasks - hammasini o'chirish"
+    bot.reply_to(message, tasks_text)
 
-    # Create bot instance
-    bot = MediaBot()
+@bot.message_handler(commands=['clear_tasks'])
+def clear_tasks(message):
+    user_id = message.from_user.id
+    
+    if user_id in user_tasks:
+        user_tasks[user_id] = []
+        bot.reply_to(message, "🗑 Barcha vazifalar o'chirildi!\n\n/add_task - yangi vazifa qo'shish")
+    else:
+        bot.reply_to(message, "📋 Sizda vazifalar yo'q edi.")
 
-    # Create application
-    app = Application.builder().token(BOT_TOKEN).build()
+@bot.message_handler(commands=['example'])
+def send_example(message):
+    example_text = """
+📚 **Misol:**
 
-    # Add handlers
-    app.add_handler(CommandHandler("start", bot.start_command))
-    app.add_handler(CommandHandler("help", bot.help_command))
-    app.add_handler(CallbackQueryHandler(bot.button_callback, pattern="^(help_|about|back)"))
-    app.add_handler(CallbackQueryHandler(bot.handle_download_callback, pattern="^(dl_|cancel_)"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+**Siz yozsangiz:**
+9:00 maktab
+14:00 uy vazifasi
+19:00 kitob o'qish
 
-    # Start bot
-    print("🚀 Bot ishga tushmoqda...")
-    print("📱 Telegram'da botingizni toping va /start bosing")
-    print("🔗 Video linkini yuboring va yuklab oling!")
-    print("\n⏹ To'xtatish uchun Ctrl+C bosing")
+**Men javob beraman:**
+🗓 Bugungi rejangiz:
 
+• ⏰ 08:00 – Uyg'onish
+• 🥞 08:30 – Nonushta  
+• 🎓 09:00 – Maktab
+• 💧 12:00 – Suv ichish
+• 🥗 13:00 – Tushlik
+• 📝 14:00 – Uy vazifasi
+• 📚 19:00 – Kitob o'qish
+• 🌙 22:30 – Uyqu vaqti
+
+**Vazifa qo'shish:**
+/add_task buyrug'i bilan doimiy vazifalar qo'shing!
+"""
+    bot.reply_to(message, example_text)
+
+@bot.message_handler(commands=['today'])
+def show_today_schedule(message):
+    user_id = message.from_user.id
+    
+    # Foydalanuvchi vazifalarini olish
+    user_daily_tasks = user_tasks.get(user_id, [])
+    
+    if user_daily_tasks:
+        # Sog'lom odatlarni qo'shish
+        complete_schedule = add_healthy_habits(user_daily_tasks)
+        schedule_text = format_schedule(complete_schedule)
+        bot.reply_to(message, schedule_text)
+    else:
+        # Standart reja
+        default_schedule = get_default_schedule()
+        schedule_text = "🧠 Bugungi tavsiya reja:\n\n"
+        for task in default_schedule:
+            schedule_text += f"• {task['emoji']} {task['time']} – {task['task']}\n"
+        
+        schedule_text += "\n💡 /add_task bilan o'z vazifalaringizni qo'shing!"
+        bot.reply_to(message, schedule_text)
+
+# Admin buyruqlari
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "❌ Sizda admin huquqi yo'q!")
+        return
+    
+    admin_text = f"""
+👑 **Admin Panel**
+
+📊 **Statistika:**
+• Foydalanuvchilar soni: {len(users_data)}
+• Vazifalar soni: {sum(len(tasks) for tasks in user_tasks.values())}
+
+🔧 **Buyruqlar:**
+/stats - Batafsil statistika
+/broadcast - Xabar yuborish
+"""
+    bot.reply_to(message, admin_text)
+
+@bot.message_handler(commands=['stats'])
+def show_stats(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    total_users = len(users_data)
+    total_tasks = sum(len(tasks) for tasks in user_tasks.values())
+    active_users = len([uid for uid, data in users_data.items() 
+                       if 'created_at' in data])
+    
+    stats_text = f"""
+📊 **Bot Statistikasi:**
+
+👥 Jami foydalanuvchilar: {total_users}
+📝 Jami vazifalar: {total_tasks}
+✅ Faol foydalanuvchilar: {active_users}
+🕐 Oxirgi yangilanish: {datetime.now().strftime('%H:%M')}
+"""
+    bot.reply_to(message, stats_text)
+
+@bot.message_handler(func=lambda message: True)
+def handle_schedule(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    
+    # Agar foydalanuvchi hech narsa yozmasa yoki juda qisqa bo'lsa
+    if not text or len(text) < 3:
+        default_schedule = get_default_schedule()
+        schedule_text = "🧠 Bugungi tavsiya reja:\n\n"
+        for task in default_schedule:
+            schedule_text += f"• {task['emoji']} {task['time']} – {task['task']}\n"
+        
+        schedule_text += "\n💡 O'z rejangizni yozing yoki /add_task bilan vazifa qo'shing!"
+        bot.reply_to(message, schedule_text)
+        return
+    
     try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except KeyboardInterrupt:
-        print("\n👋 Bot to'xtatildi!")
+        # Matnni tahlil qilish
+        parsed_tasks = parse_time_tasks(text)
+        
+        if not parsed_tasks:
+            bot.reply_to(message, "🤔 Rejangizni tushunmadim. Misol:\n\n8:00 uyg'onish\n12:00 tushlik\n\n/example - batafsil misol")
+            return
+        
+        # Foydalanuvchi vazifalarini qo'shish
+        user_daily_tasks = user_tasks.get(user_id, [])
+        all_tasks = parsed_tasks + user_daily_tasks
+        
+        # Sog'lom odatlarni qo'shish
+        complete_schedule = add_healthy_habits(all_tasks)
+        
+        # Foydalanuvchi ma'lumotlarini saqlash
+        users_data[user_id] = {
+            'schedule': complete_schedule,
+            'created_at': datetime.now().isoformat()
+        }
+        
+        # Rejani formatlab jo'natish
+        schedule_text = format_schedule(complete_schedule)
+        schedule_text += "\n✅ Reja tayyor! Muvaffaqiyatli kun tilayaman!"
+        schedule_text += "\n\n💡 /add_task - doimiy vazifalar qo'shish"
+        
+        bot.reply_to(message, schedule_text)
+        
     except Exception as e:
-        print(f"❌ Xatolik: {e}")
+        bot.reply_to(message, "😅 Xatolik yuz berdi. Qaytadan urinib ko'ring yoki /help ni bosing.")
+        print(f"Xatolik: {e}")
 
 if __name__ == '__main__':
-    main()
+    print("🤖 Bot ishga tushmoqda...")
+    print(f"🔑 Bot Token: {BOT_TOKEN[:10]}...")
+    print(f"👑 Admin ID: {ADMIN_ID}")
+    print("⚠️  BOT_TOKEN va ADMIN_ID ni o'z ma'lumotlaringiz bilan almashtiring!")
+    
+    try:
+        bot.polling(none_stop=True)
+    except Exception as e:
+        print(f"Bot xatolik: {e}")
